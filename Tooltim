@@ -1,0 +1,635 @@
+#!/usr/bin/env python3
+import os
+import sys
+import socket
+import subprocess
+import platform
+import json
+import csv
+import time
+import shutil
+import threading
+from datetime import datetime
+
+# --- Installation automatique des dépendances ---
+def install_dependencies():
+    required_packages = ["scapy", "pyfiglet", "colorama", "tqdm", "requests"]
+    for package in required_packages:
+        try:
+            __import__(package)
+        except ImportError:
+            print(f"[*] Installation de {package}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package, "--break-system-packages", "-q"])
+
+install_dependencies()
+
+from colorama import init, Fore, Style
+from tqdm import tqdm
+import requests
+
+init(autoreset=True)
+
+# ══════════════════════════════════════════════════
+#   VRAI DÉGRADÉ RGB — interpolation caractère/ligne
+# ══════════════════════════════════════════════════
+
+def rgb(r, g, b):
+    """Retourne le code ANSI 24-bit pour une couleur RGB."""
+    return f"\x1b[38;2;{r};{g};{b}m"
+
+RESET = "\x1b[0m"
+
+def interpolate_color(c1, c2, t):
+    """Interpole linéairement entre deux couleurs RGB. t ∈ [0.0, 1.0]"""
+    return (
+        int(c1[0] + (c2[0] - c1[0]) * t),
+        int(c1[1] + (c2[1] - c1[1]) * t),
+        int(c1[2] + (c2[2] - c1[2]) * t),
+    )
+
+def gradient_text(text, colors):
+    """
+    Applique un dégradé horizontal sur `text` en passant par la liste `colors`.
+    `colors` est une liste de tuples (R, G, B).
+    """
+    if not text:
+        return ""
+    segments = len(colors) - 1
+    length = len(text)
+    result = ""
+    for i, ch in enumerate(text):
+        t_global = i / max(length - 1, 1)
+        seg = min(int(t_global * segments), segments - 1)
+        t_local = t_global * segments - seg
+        r, g, b = interpolate_color(colors[seg], colors[seg + 1], t_local)
+        result += rgb(r, g, b) + ch
+    return result + RESET
+
+def center_text(text):
+    """Centre le texte (ignore les codes ANSI pour le calcul de la largeur)."""
+    import re
+    ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
+    visible = ansi_escape.sub('', text)
+    terminal_width = shutil.get_terminal_size((80, 24)).columns
+    pad = max((terminal_width - len(visible)) // 2, 0)
+    return " " * pad + text
+
+# Palette dégradé : violet → rouge → orange → jaune → cyan
+PALETTE = [
+    (148, 0,   211),   # violet
+    (255, 0,   100),   # rose-rouge
+    (255, 80,  0  ),   # orange
+    (255, 220, 0  ),   # jaune
+    (0,   200, 255),   # cyan
+]
+
+def grad(text):
+    """Raccourci : applique le dégradé principal."""
+    return gradient_text(text, PALETTE)
+
+# Couleurs utilitaires simples (sans dépendance externe)
+def blue(t):    return f"\x1b[38;2;80;180;255m{t}{RESET}"
+def green(t):   return f"\x1b[38;2;80;255;130m{t}{RESET}"
+def red(t):     return f"\x1b[38;2;255;80;80m{t}{RESET}"
+def yellow(t):  return f"\x1b[38;2;255;220;50m{t}{RESET}"
+def cyan(t):    return f"\x1b[38;2;0;220;220m{t}{RESET}"
+def purple(t):  return f"\x1b[38;2;180;80;255m{t}{RESET}"
+
+# ══════════════════════════════════════════════════
+#   TITRE ASCII avec dégradé horizontal réel
+# ══════════════════════════════════════════════════
+
+BANNER = r"""
+  _______         ______            __      __  ___           __
+ /_  __(_)___ ___/_  __/___  ____  / /     /  |/  /___ ______/ /____  _____
+  / / / / __ `__ \/ / / __ \/ __ \/ /_____/ /|_/ / __ `/ ___/ __/ _ \/ ___/
+ / / / / / / / / / / / /_/ / /_/ / /_____/ /  / / /_/ (__  ) /_/  __/ /
+/_/ /_/_/ /_/ /_/_/  \____/\____/_/     /_/  /_/\__,_/____/\__/\___/_/
+
+"""
+
+BANNER2 = ""  # (tout est dans BANNER)
+
+def afficher_titre():
+    os.system('cls' if os.name == 'nt' else 'clear')
+    lines = [l for l in (BANNER + BANNER2).split("\n") if l.strip()]
+
+    # Largeur max du bloc ASCII → padding fixe pour tout le bloc
+    max_w = max(len(l) for l in lines)
+    terminal_w = shutil.get_terminal_size((100, 24)).columns
+    pad = " " * max(0, (terminal_w - max_w) // 2)
+
+    for line in lines:
+        print(pad + grad(line))
+
+    print()
+    sep   = "═" * 60
+    titre = "★  Outil Réseau Ultimate  ·  v9  ★"
+    sep_pad = " " * max(0, (terminal_w - 60) // 2)
+    print(sep_pad + grad(sep))
+    print(sep_pad + grad(titre.center(60)))
+    print(sep_pad + grad(sep))
+    print()
+
+# ══════════════════════════════════════════════════
+#   DÉTECTION IP LOCALE
+# ══════════════════════════════════════════════════
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+        return local_ip
+    except:
+        return "127.0.0.1"
+
+# ══════════════════════════════════════════════════
+#   SCAN ARP
+# ══════════════════════════════════════════════════
+
+def scan_arp(plage_ip):
+    try:
+        from scapy.all import ARP, Ether, srp
+        print(blue(f"\n[*] Scan ARP sur {plage_ip}..."))
+        arp    = ARP(pdst=plage_ip)
+        ether  = Ether(dst="ff:ff:ff:ff:ff:ff")
+        paquet = ether / arp
+        result = srp(paquet, timeout=2, verbose=0)[0]
+        appareils = []
+        for sent, received in result:
+            appareils.append({
+                "ip":     received.psrc,
+                "mac":    received.hwsrc,
+                "vendor": get_vendor(received.hwsrc)
+            })
+        return appareils if appareils else [{"info": "Aucun appareil trouvé."}]
+    except Exception as e:
+        return [{"error": f"Erreur: {e}"}]
+
+def get_vendor(mac):
+    try:
+        with open("vendors.json", "r") as f:
+            vendors = json.load(f)
+        prefix = mac[:8].upper().replace(":", "")
+        return vendors.get(prefix, "Inconnu")
+    except:
+        return "Inconnu"
+
+# ══════════════════════════════════════════════════
+#   PING SWEEP
+# ══════════════════════════════════════════════════
+
+def ping_sweep(plage_ip):
+    try:
+        from scapy.all import ip_network
+    except ImportError:
+        from ipaddress import ip_network
+    print(blue(f"\n[*] Ping Sweep sur {plage_ip}..."))
+    hosts_up = []
+    for ip in ip_network(plage_ip, strict=False).hosts():
+        ip_str = str(ip)
+        if platform.system() == "Windows":
+            response = os.system(f"ping -n 1 -w 100 {ip_str} > nul 2>&1")
+        else:
+            response = os.system(f"ping -c 1 -W 1 {ip_str} > /dev/null 2>&1")
+        if response == 0:
+            hosts_up.append(ip_str)
+    return hosts_up if hosts_up else ["Aucun hôte actif trouvé."]
+
+# ══════════════════════════════════════════════════
+#   TRACEROUTE
+# ══════════════════════════════════════════════════
+
+def traceroute_host(ip, max_hops=30):
+    print(blue(f"\n[*] Traceroute vers {ip}..."))
+    try:
+        if platform.system() == "Windows":
+            result = subprocess.run(
+                f"tracert -h {max_hops} {ip}",
+                capture_output=True, text=True, shell=True)
+        else:
+            result = subprocess.run(
+                f"traceroute -m {max_hops} {ip}",
+                capture_output=True, text=True, shell=True)
+        return result.stdout.splitlines()
+    except Exception as e:
+        return [f"Erreur: {e}"]
+
+# ══════════════════════════════════════════════════
+#   SCAN TCP SYN
+# ══════════════════════════════════════════════════
+
+def syn_scan(ip, ports=None):
+    from scapy.all import IP, TCP, srp1
+    if ports is None:
+        ports = [21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 3389, 8080]
+    else:
+        ports = [int(p) for p in ports.split(",")]
+    print(blue(f"\n[*] Scan TCP SYN sur {ip}..."))
+    open_ports = []
+    for port in tqdm(ports, desc="Scanning", unit="port"):
+        try:
+            packet   = IP(dst=ip) / TCP(dport=port, flags="S")
+            response = srp1(packet, timeout=1, verbose=0)
+            if response and response.haslayer(TCP) and response.getlayer(TCP).flags == 0x12:
+                open_ports.append(port)
+                srp1(IP(dst=ip) / TCP(dport=port, flags="R"), timeout=1, verbose=0)
+        except:
+            continue
+    return open_ports if open_ports else ["Aucun port ouvert trouvé."]
+
+# ══════════════════════════════════════════════════
+#   SCAN UDP
+# ══════════════════════════════════════════════════
+
+def udp_scan(ip, ports=None):
+    from scapy.all import IP, UDP, srp1
+    if ports is None:
+        ports = [53, 67, 68, 69, 123, 137, 138, 161, 162, 500, 514, 520]
+    else:
+        ports = [int(p) for p in ports.split(",")]
+    print(blue(f"\n[*] Scan UDP sur {ip}..."))
+    open_ports = []
+    for port in tqdm(ports, desc="Scanning", unit="port"):
+        try:
+            packet   = IP(dst=ip) / UDP(dport=port)
+            response = srp1(packet, timeout=2, verbose=0)
+            if response is None:
+                open_ports.append(port)
+        except:
+            continue
+    return open_ports if open_ports else ["Aucun port UDP ouvert trouvé."]
+
+# ══════════════════════════════════════════════════
+#   DÉTECTION FIREWALL
+# ══════════════════════════════════════════════════
+
+def detect_firewall(ip):
+    print(blue(f"\n[*] Détection de firewall sur {ip}..."))
+    filtered_ports = []
+    common_ports = [21, 22, 23, 25, 80, 110, 143, 443, 445, 3389]
+    for port in common_ports:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        result = sock.connect_ex((ip, port))
+        if result != 0:
+            filtered_ports.append(port)
+        sock.close()
+    return filtered_ports if filtered_ports else ["Aucun port filtré détecté."]
+
+# ══════════════════════════════════════════════════
+#   DÉTECTION MTU
+# ══════════════════════════════════════════════════
+
+def detect_mtu(ip):
+    print(blue(f"\n[*] Détection de MTU vers {ip}..."))
+    try:
+        if platform.system() == "Windows":
+            result = subprocess.run(
+                f"ping -f -l 1472 {ip}", capture_output=True, text=True, shell=True)
+        else:
+            result = subprocess.run(
+                f"ping -M do -s 1472 -c 1 {ip}", capture_output=True, text=True, shell=True)
+        if "fragmentation needed" in result.stderr.lower() or "Frag needed" in result.stdout:
+            return "MTU < 1500 (fragmentation requise)"
+        else:
+            return "MTU >= 1500 (pas de fragmentation)"
+    except Exception as e:
+        return f"Erreur: {e}"
+
+# ══════════════════════════════════════════════════
+#   TEST DE LATENCE
+# ══════════════════════════════════════════════════
+
+def test_latence(ip, count=4):
+    print(blue(f"\n[*] Test de latence vers {ip}..."))
+    try:
+        if platform.system() == "Windows":
+            result = subprocess.run(
+                f"ping -n {count} {ip}", capture_output=True, text=True, shell=True)
+        else:
+            result = subprocess.run(
+                f"ping -c {count} {ip}", capture_output=True, text=True, shell=True)
+        return result.stdout
+    except Exception as e:
+        return f"Erreur: {e}"
+
+# ══════════════════════════════════════════════════
+#   DÉTECTION NAT
+# ══════════════════════════════════════════════════
+
+def detect_nat():
+    print(blue("\n[*] Détection de NAT..."))
+    try:
+        public_ip  = requests.get("https://api.ipify.org", timeout=5).text.strip()
+        private_ip = get_local_ip()
+        if public_ip != private_ip:
+            return f"NAT détecté  (IP publique: {public_ip}  /  IP privée: {private_ip})"
+        else:
+            return "Pas de NAT détecté (IP publique = IP privée)"
+    except Exception as e:
+        return f"Erreur: {e}"
+
+# ══════════════════════════════════════════════════
+#   DÉTECTION ROUTEURS (TTL)
+# ══════════════════════════════════════════════════
+
+def detect_routeurs(ip):
+    print(blue(f"\n[*] Détection de routeurs via TTL vers {ip}..."))
+    try:
+        if platform.system() == "Windows":
+            result = subprocess.run(
+                f"ping -n 1 {ip}", capture_output=True, text=True, shell=True)
+        else:
+            result = subprocess.run(
+                f"ping -c 1 {ip}", capture_output=True, text=True, shell=True)
+        ttl_line = [line for line in result.stdout.splitlines() if "TTL=" in line or "ttl=" in line.lower()]
+        if ttl_line:
+            raw = ttl_line[0].lower().split("ttl=")[1].split()[0].strip()
+            ttl = int(''.join(filter(str.isdigit, raw)))
+            if ttl <= 64:
+                return f"Routeur Linux/Unix probable (TTL={ttl})"
+            elif ttl <= 128:
+                return f"Routeur Windows probable (TTL={ttl})"
+            else:
+                return f"Équipement réseau (TTL={ttl} élevé)"
+        else:
+            return "TTL non détecté (hôte injoignable ?)"
+    except Exception as e:
+        return f"Erreur: {e}"
+
+# ══════════════════════════════════════════════════
+#   SNIFFER RÉSEAU
+# ══════════════════════════════════════════════════
+
+def sniffer_reseau(interface, count=10, filtre=None):
+    from scapy.all import sniff
+    print(blue(f"\n[*] Sniffing sur {interface} ({count} paquets)..."))
+    try:
+        kwargs = {"iface": interface, "count": count}
+        if filtre:
+            kwargs["filter"] = filtre
+        paquets = sniff(**kwargs)
+        return [p.summary() for p in paquets]
+    except Exception as e:
+        return [f"Erreur: {e}. Vérifiez l'interface ou les permissions (root)."]
+
+# ══════════════════════════════════════════════════
+#   EXPORT DES RÉSULTATS
+# ══════════════════════════════════════════════════
+
+def exporter_resultats(data, format="txt", nom_fichier=None):
+    if not nom_fichier:
+        nom_fichier = f"scan_resultats_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    if format == "json":
+        with open(f"{nom_fichier}.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+    elif format == "csv":
+        with open(f"{nom_fichier}.csv", "w", newline='', encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                writer.writerow(data[0].keys())
+                for row in data:
+                    writer.writerow(row.values())
+            else:
+                writer.writerow(["Données", str(data)])
+    else:
+        with open(f"{nom_fichier}.txt", "w", encoding="utf-8") as f:
+            f.write(str(data))
+    print(green(f"\n[+] Résultats exportés → {nom_fichier}.{format}"))
+
+# ══════════════════════════════════════════════════
+#   SCAN IP — Infos complètes sur une IP
+# ══════════════════════════════════════════════════
+
+def scan_ip(ip):
+    print(blue(f"\n[*] Scan IP de {ip}..."))
+    resultats = {}
+
+    # Résolution DNS
+    try:
+        hostname = socket.gethostbyaddr(ip)[0]
+        resultats["Hostname"] = hostname
+    except:
+        resultats["Hostname"] = "N/A"
+
+    # Géolocalisation + infos via ipinfo.io
+    try:
+        r = requests.get(f"https://ipinfo.io/{ip}/json", timeout=5)
+        data = r.json()
+        resultats["IP"]           = data.get("ip", ip)
+        resultats["Ville"]        = data.get("city", "N/A")
+        resultats["Région"]       = data.get("region", "N/A")
+        resultats["Pays"]         = data.get("country", "N/A")
+        resultats["Organisation"] = data.get("org", "N/A")
+        resultats["FAI"]          = data.get("org", "N/A")
+        resultats["Timezone"]     = data.get("timezone", "N/A")
+        resultats["Localisation"] = data.get("loc", "N/A")
+        resultats["Code postal"]  = data.get("postal", "N/A")
+    except Exception as e:
+        resultats["Géoloc"] = f"Erreur: {e}"
+
+    # Ping rapide (statut)
+    if platform.system() == "Windows":
+        r = os.system(f"ping -n 1 -w 500 {ip} > nul 2>&1")
+    else:
+        r = os.system(f"ping -c 1 -W 1 {ip} > /dev/null 2>&1")
+    resultats["Statut"] = green("En ligne ✔") if r == 0 else red("Hors ligne ✘")
+
+    # Ports ouverts rapides (top 10)
+    ports_communs = [21, 22, 23, 25, 53, 80, 443, 3306, 3389, 8080]
+    ouverts = []
+    for port in ports_communs:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        if s.connect_ex((ip, port)) == 0:
+            ouverts.append(port)
+        s.close()
+    resultats["Ports ouverts (top 10)"] = ouverts if ouverts else ["Aucun"]
+
+    # Affichage
+    print()
+    print(grad("  ┌─── Résultats Scan IP ────────────────────────┐"))
+    for cle, val in resultats.items():
+        if cle == "Statut":
+            print(f"  │  {yellow(cle+':')<30}  {val}")
+        else:
+            print(f"  │  {yellow(cle+':'):<30}  {val}")
+    print(grad("  └──────────────────────────────────────────────┘"))
+
+    return {k: str(v) for k, v in resultats.items()}
+
+# ══════════════════════════════════════════════════
+#   AIDE
+# ══════════════════════════════════════════════════
+
+def afficher_aide():
+    print(grad("\n═══════════════ Aide / Commandes ═══════════════\n"))
+    descriptions = {
+        "1":  "Liste les appareils sur un réseau local (IP + MAC + constructeur).",
+        "2":  "Détecte les hôtes actifs via ICMP.",
+        "3":  "Affiche le chemin réseau vers une IP/cible.",
+        "4":  "Scan furtif des ports TCP (ne complète pas la connexion TCP).",
+        "5":  "Détecte les ports UDP ouverts (DNS, SNMP, DHCP…).",
+        "6":  "Identifie les ports filtrés / bloqués par un firewall.",
+        "7":  "Teste la taille maximale des paquets (fragmentation).",
+        "8":  "Mesure le ping vers une IP avec statistiques min/avg/max.",
+        "9":  "Vérifie si tu es derrière un NAT (IP publique vs privée).",
+        "10": "Analyse le TTL pour deviner les routeurs intermédiaires.",
+        "11": "Capture les paquets sur une interface (filtres BPF possibles).",
+        "12": "Affiche cette aide.",
+        "13": "Scan IP (Infos complètes sur une IP).",
+    }
+    for num in descriptions:
+        print(gradient_text(f"  [{num:>2}] {descriptions[num][:24]:<24}", [(0,200,255),(148,0,211)]) +
+              f"  {descriptions[num]}")
+    print()
+
+# ══════════════════════════════════════════════════
+#   MENU PRINCIPAL
+# ══════════════════════════════════════════════════
+
+MENU_ITEMS = [
+    ("1",  "Scan ARP"),
+    ("2",  "Ping Sweep"),
+    ("3",  "Traceroute"),
+    ("4",  "Scan TCP SYN"),
+    ("5",  "Scan UDP"),
+    ("6",  "Détection de Firewall"),
+    ("7",  "Détection de MTU"),
+    ("8",  "Test de Latence"),
+    ("9",  "Détection de NAT"),
+    ("10", "Détection de Routeurs"),
+    ("11", "Sniffer Réseau"),
+    ("12", "Aide"),
+    ("13", "Scan IP"),
+]
+
+def menu():
+    os.system('cls' if os.name == 'nt' else 'clear')
+    afficher_titre()
+    for num, nom in MENU_ITEMS:
+        print(gradient_text(f"  [{num:>2}] {nom:<24}", [(0,200,255),(148,0,211)]))
+    print(red("  [ 0] Quitter"))
+    return input(yellow("\nChoix : "))
+
+# ══════════════════════════════════════════════════
+#   BOUCLE PRINCIPALE
+# ══════════════════════════════════════════════════
+
+def main():
+    while True:
+        choix = menu()
+
+        if choix == "1":
+            plage = input(blue("Plage IP (ex: 192.168.1.0/24) : "))
+            result = scan_arp(plage)
+            for item in result:
+                if "error" in item:
+                    print(red(item["error"]))
+                elif "info" in item:
+                    print(blue(item["info"]))
+                else:
+                    print(grad(f"  IP: {item['ip']:<18}") +
+                          f"  MAC: {item['mac']}  Constructeur: {item['vendor']}")
+            if input(yellow("\nExporter ? (o/n) : ")).lower() == "o":
+                exporter_resultats(result, format=input("Format (txt/json/csv) : ") or "txt")
+
+        elif choix == "2":
+            plage = input(blue("Plage IP (ex: 192.168.1.0/24) : "))
+            result = ping_sweep(plage)
+            for host in result:
+                print(grad(f"  ✔  {host}"))
+            if input(yellow("\nExporter ? (o/n) : ")).lower() == "o":
+                exporter_resultats(result, format=input("Format (txt/json/csv) : ") or "txt")
+
+        elif choix == "3":
+            ip = input(blue("IP ou domaine : "))
+            result = traceroute_host(ip)
+            for line in result:
+                print(line)
+            if input(yellow("\nExporter ? (o/n) : ")).lower() == "o":
+                exporter_resultats(result, format=input("Format (txt/json/csv) : ") or "txt")
+
+        elif choix == "4":
+            ip    = input(blue("IP à scanner : "))
+            ports = input(blue("Ports (vide=courants, ex: 80,443) : "))
+            result = syn_scan(ip, ports if ports else None)
+            print(green(f"\n  Ports TCP ouverts : {result}"))
+            if input(yellow("\nExporter ? (o/n) : ")).lower() == "o":
+                exporter_resultats(result, format=input("Format (txt/json/csv) : ") or "txt")
+
+        elif choix == "5":
+            ip    = input(blue("IP à scanner : "))
+            ports = input(blue("Ports UDP (vide=courants, ex: 53,67) : "))
+            result = udp_scan(ip, ports if ports else None)
+            print(green(f"\n  Ports UDP ouverts : {result}"))
+            if input(yellow("\nExporter ? (o/n) : ")).lower() == "o":
+                exporter_resultats(result, format=input("Format (txt/json/csv) : ") or "txt")
+
+        elif choix == "6":
+            ip = input(blue("IP à tester : "))
+            result = detect_firewall(ip)
+            print(green(f"\n  Ports filtrés : {result}"))
+            if input(yellow("\nExporter ? (o/n) : ")).lower() == "o":
+                exporter_resultats(result, format=input("Format (txt/json/csv) : ") or "txt")
+
+        elif choix == "7":
+            ip = input(blue("IP à tester : "))
+            result = detect_mtu(ip)
+            print(green(f"\n  MTU : {result}"))
+            if input(yellow("\nExporter ? (o/n) : ")).lower() == "o":
+                exporter_resultats(result, format=input("Format (txt/json/csv) : ") or "txt")
+
+        elif choix == "8":
+            ip = input(blue("IP à tester : "))
+            result = test_latence(ip)
+            print(result)
+            if input(yellow("\nExporter ? (o/n) : ")).lower() == "o":
+                exporter_resultats(result, format=input("Format (txt/json/csv) : ") or "txt")
+
+        elif choix == "9":
+            result = detect_nat()
+            print(green(f"\n  {result}"))
+            if input(yellow("\nExporter ? (o/n) : ")).lower() == "o":
+                exporter_resultats(result, format=input("Format (txt/json/csv) : ") or "txt")
+
+        elif choix == "10":
+            ip = input(blue("IP à tester : "))
+            result = detect_routeurs(ip)
+            print(green(f"\n  {result}"))
+            if input(yellow("\nExporter ? (o/n) : ")).lower() == "o":
+                exporter_resultats(result, format=input("Format (txt/json/csv) : ") or "txt")
+
+        elif choix == "11":
+            interface = input(blue("Interface (ex: eth0, wlan0) : "))
+            count     = int(input(blue("Nombre de paquets (défaut: 10) : ")) or 10)
+            filtre    = input(blue("Filtre BPF (ex: 'tcp', 'udp', vide=aucun) : ")) or None
+            result    = sniffer_reseau(interface, count, filtre)
+            for p in result:
+                print(p)
+            if input(yellow("\nExporter ? (o/n) : ")).lower() == "o":
+                exporter_resultats(result, format=input("Format (txt/json/csv) : ") or "txt")
+
+        elif choix == "12":
+            afficher_aide()
+
+        elif choix == "13":
+            ip = input(blue("IP à analyser (ex: 8.8.8.8) : "))
+            result = scan_ip(ip)
+            if input(yellow("\nExporter ? (o/n) : ")).lower() == "o":
+                exporter_resultats(result, format=input("Format (txt/json/csv) : ") or "txt")
+
+        elif choix == "0":
+            print(grad("\n  Au revoir !  \n"))
+            break
+
+        else:
+            print(red("  Choix invalide."))
+
+        input(blue("\n  Appuyez sur Entrée pour continuer..."))
+
+if __name__ == "__main__":
+    main()
