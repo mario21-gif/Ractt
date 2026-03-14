@@ -2,6 +2,79 @@ import socket
 import subprocess
 import webbrowser
 import os
+import time
+import requests
+
+# --- CONFIGURATION ---
+HOST = '192.168.1.54'  # <--- VÉRIFIE BIEN L'IP DE TON TEL ICI
+PORT = 65432
+PASSWORD = "1234"      # <--- DOIT ÊTRE LE MÊME QUE SUR LE SERVEUR
+
+def execute_action(command):
+    try:
+        if command.startswith("popup:"):
+            subprocess.run(['notify-send', '📱 Mobile', command[6:]])
+            return "Notification affichée"
+        
+        elif command.startswith("speak:"):
+            # Utilise espeak-ng (que tu as installé avec dnf)
+            subprocess.run(['espeak-ng', '-v', 'fr', command[6:]])
+            return "Vocalisation réussie"
+        
+        elif command.startswith("browser:"):
+            webbrowser.open(command[8:])
+            return f"Lien ouvert : {command[8:]}"
+        
+        elif command == "lock":
+            os.system("xdg-screensaver lock")
+            return "PC verrouillé"
+        
+        elif command == "battery":
+            with open("/sys/class/power_supply/BAT0/capacity", "r") as f:
+                cap = f.read().strip()
+            return f"Batterie : {cap}%"
+            
+        elif command == "location":
+            r = requests.get('https://ipinfo.io/json', timeout=5).json()
+            return f"Ville: {r.get('city')}, IP: {r.get('ip')}"
+
+        return "Commande non reconnue"
+    except Exception as e:
+        return f"Erreur : {str(e)}"
+
+def main():
+    print(f"[*] Recherche du serveur Android sur {HOST}...")
+    while True:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(10)
+                s.connect((HOST, PORT))
+                
+                # Phase d'authentification
+                msg = s.recv(1024).decode()
+                if msg == "AUTH_REQUIRED":
+                    s.sendall(PASSWORD.encode())
+                
+                status = s.recv(1024).decode()
+                if status == "AUTH_SUCCESS":
+                    print("[+] Connecté et authentifié !")
+                    s.settimeout(None)
+                    while True:
+                        data = s.recv(4096).decode()
+                        if not data or data == "exit": 
+                            break
+                        print(f"[-] Reçu : {data}")
+                        reponse = execute_action(data)
+                        s.sendall(reponse.encode())
+        except Exception:
+            # Attend 5 secondes avant de réessayer si le serveur est absent
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()import socket
+import subprocess
+import webbrowser
+import os
 import platform
 import threading
 import time
