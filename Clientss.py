@@ -1,4 +1,83 @@
+import socket
 import subprocess
+import webbrowser
+import os
+import platform
+import threading
+import time
+# Modules à installer avec 'pip install requests'
+try:
+    import requests
+except ImportError:
+    requests = None
+
+# --- CONFIGURATION ---
+HOST = '192.168.1.54' # IP de ton téléphone
+PORT = 65432
+PASSWORD = "1234"
+
+def execute_action(command):
+    try:
+        if command.startswith("popup:"):
+            # notify-send est intégré à Bazzite
+            subprocess.run(['notify-send', '📱 Mobile', command[6:]])
+            return "Notification OK"
+        
+        elif command.startswith("speak:"):
+            # spd-say est le standard Linux pour la synthèse vocale
+            subprocess.run(['spd-say', command[6:]])
+            return "Vocalisation OK"
+        
+        elif command.startswith("browser:"):
+            webbrowser.open(command[8:])
+            return "Navigateur ouvert"
+        
+        elif command == "lock":
+            os.system("xdg-screensaver lock")
+            return "Session verrouillée"
+        
+        elif command == "battery":
+            # Lecture du fichier système Linux pour la batterie
+            with open("/sys/class/power_supply/BAT0/capacity", "r") as f:
+                return f"Batterie : {f.read().strip()}%"
+        
+        elif command == "location":
+            if requests:
+                r = requests.get('https://ipinfo.io/json', timeout=5).json()
+                return f"Ville: {r.get('city')}, IP: {r.get('ip')}"
+            return "Module 'requests' manquant sur le PC"
+            
+        return "Commande inconnue"
+    except Exception as e:
+        return f"Erreur : {str(e)}"
+
+def main():
+    print(f"[*] Recherche de l'Android sur {HOST}...")
+    while True:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(10)
+                s.connect((HOST, PORT))
+                
+                # Auth
+                if s.recv(1024) == b"AUTH_REQUIRED":
+                    s.sendall(PASSWORD.encode())
+                
+                if s.recv(1024) == b"AUTH_SUCCESS":
+                    print("[+] Connecté !")
+                    s.settimeout(None)
+                    while True:
+                        data = s.recv(4096).decode()
+                        if not data or data == "exit": break
+                        # threading permet de lancer l'action sans geler le script
+                        res = execute_action(data)
+                        s.sendall(res.encode())
+        except Exception:
+            # Reconnexion auto toutes les 5 secondes
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()import subprocess
 import webbrowser
 import requests
 import os
