@@ -63,4 +63,4 @@ def main():
             time.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    main() il devraispas etre fonctinell sur toutl les systeme dexploitation
